@@ -1,0 +1,10 @@
+server:
+  listen_address: ":9898" 
+  read_timeout: 60s      
+  write_timeout: 60s     
+
+log:
+  data_dir: ./fluxgo-data 
+  max_segment_bytes: 33554432 
+  max_log_bytes: 2147483648  
+  file_sync: true          
