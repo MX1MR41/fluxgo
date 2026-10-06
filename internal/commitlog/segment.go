@@ -2,8 +2,10 @@ package commitlog
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,13 +15,16 @@ const (
 	logSuffix   = ".log"
 	indexSuffix = ".index"
 
+	// recordLengthWidth is the size of the per-record length prefix.
 	recordLengthWidth = 8
-
-	indexOffsetWidth = 8
-
-	indexPositionWidth = 8
 )
 
+// Segment is one pair of .log/.index files covering offsets
+// [baseOffset, nextOffset). Records are appended to the .log file as
+// [8B length][payload] and mirrored by one 16-byte index entry per record.
+//
+// The .log file is the source of truth: the index is an acceleration
+// structure that recovery can always rebuild by scanning the log.
 type Segment struct {
 	mu sync.RWMutex
 
@@ -32,57 +37,288 @@ type Segment struct {
 	index *index
 
 	storeSize int64
-
-	fileSync bool
+	fileSync  bool
 }
 
-func newSegment(dir string, baseOffset uint64, config Config) (*Segment, error) {
+// openSegment opens (or creates) the segment with the given base offset. When
+// reconcile is true, the log file is scanned and brought into agreement with
+// the index (crash recovery); when false, the index is trusted as-is, which
+// is safe for sealed segments while fileSync is on.
+func openSegment(dir string, baseOffset uint64, cfg Config, reconcile bool, logger *slog.Logger) (*Segment, error) {
 	s := &Segment{
 		dir:        dir,
 		baseOffset: baseOffset,
-		maxBytes:   config.MaxSegmentBytes,
-		fileSync:   config.FileSync,
+		nextOffset: baseOffset,
+		maxBytes:   cfg.MaxSegmentBytes,
+		fileSync:   cfg.FileSync,
 	}
 
-	logPath := s.logPath()
-	storeFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	storeFile, err := os.OpenFile(s.logPath(), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o666)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open/create log file %s: %w", logPath, err)
+		return nil, fmt.Errorf("commitlog: failed to open log file: %w", err)
 	}
 	s.store = storeFile
 
-	storeFi, err := storeFile.Stat()
+	// The index deliberately does NOT use O_APPEND: entries are written with
+	// WriteAt at the tracked size, which keeps appends correct across
+	// restarts (V1 used Write on a file opened without O_APPEND, so after a
+	// restart new entries overwrote the index from byte 0).
+	indexFile, err := os.OpenFile(s.indexPath(), os.O_RDWR|os.O_CREATE, 0o666)
 	if err != nil {
-		storeFile.Close()
-		return nil, fmt.Errorf("failed to stat log file %s: %w", logPath, err)
+		s.store.Close()
+		return nil, fmt.Errorf("commitlog: failed to open index file: %w", err)
 	}
-	s.storeSize = storeFi.Size()
-
-	indexPath := s.indexPath()
-	indexFile, err := os.OpenFile(indexPath, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		storeFile.Close()
-		return nil, fmt.Errorf("failed to open/create index file %s: %w", indexPath, err)
-	}
-
 	idx, err := newIndex(indexFile)
 	if err != nil {
-		storeFile.Close()
+		s.store.Close()
 		indexFile.Close()
-		return nil, fmt.Errorf("failed to initialize index %s: %w", indexPath, err)
+		return nil, err
 	}
 	s.index = idx
 
-	if idx.size > 0 {
+	storeFi, err := storeFile.Stat()
+	if err != nil {
+		s.Close()
+		return nil, fmt.Errorf("commitlog: failed to stat log file: %w", err)
+	}
+	s.storeSize = storeFi.Size()
 
-		numEntries := uint64(idx.size / indexEntryWidth)
-		s.nextOffset = baseOffset + numEntries
-	} else {
+	if err := s.recover(reconcile, logger); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("commitlog: failed to recover segment %d: %w", baseOffset, err)
+	}
+	return s, nil
+}
 
-		s.nextOffset = baseOffset
+// recover brings the segment into a consistent state after a possible crash.
+func (s *Segment) recover(reconcile bool, logger *slog.Logger) error {
+	entries, err := s.index.truncateToWholeEntries()
+	if err != nil {
+		return err
 	}
 
-	return s, nil
+	if !reconcile {
+		// Sealed segment in durable mode: trust the index. An index that is
+		// empty while the log has data can only mean the index was lost, so
+		// rebuild that case.
+		if entries == 0 && s.storeSize > 0 {
+			return s.rebuildIndex(logger)
+		}
+		s.nextOffset = s.baseOffset + uint64(entries)
+		return nil
+	}
+
+	// Crash-recovery path: scan the log (the source of truth), truncate any
+	// torn tail, and rebuild the index if it disagrees with the log.
+	positions, canonicalSize, err := s.scanLog()
+	if err != nil {
+		return err
+	}
+	if canonicalSize < s.storeSize {
+		logger.Warn("commitlog: truncating partial record tail",
+			"segment", s.baseOffset, "from", s.storeSize, "to", canonicalSize)
+		if err := s.store.Truncate(canonicalSize); err != nil {
+			return fmt.Errorf("commitlog: failed to truncate log: %w", err)
+		}
+		if err := s.store.Sync(); err != nil {
+			return fmt.Errorf("commitlog: failed to sync truncated log: %w", err)
+		}
+		s.storeSize = canonicalSize
+	}
+
+	needRebuild := int64(len(positions)) != entries
+	if !needRebuild && entries > 0 {
+		// Counts match; spot-check that the last entry agrees with the scan.
+		last, err := s.index.ReadPositionForOffset(uint64(entries - 1))
+		if err != nil || last != positions[entries-1] {
+			needRebuild = true
+		}
+	}
+	if needRebuild {
+		logger.Warn("commitlog: index out of sync with log, rebuilding",
+			"segment", s.baseOffset, "indexEntries", entries, "logRecords", len(positions))
+		if err := s.index.rewrite(positions); err != nil {
+			return err
+		}
+	}
+	s.nextOffset = s.baseOffset + uint64(len(positions))
+	return nil
+}
+
+// scanLog walks the log file and returns the start position of every complete
+// record plus the offset just past the last complete one. A partial or
+// corrupt tail is simply not included.
+func (s *Segment) scanLog() (positions []uint64, canonicalSize int64, err error) {
+	lenBuf := make([]byte, recordLengthWidth)
+	pos := int64(0)
+	for pos+recordLengthWidth <= s.storeSize {
+		if _, err := s.store.ReadAt(lenBuf, pos); err != nil {
+			return nil, 0, fmt.Errorf("commitlog: scan failed at position %d: %w", pos, err)
+		}
+		recLen := binary.BigEndian.Uint64(lenBuf)
+		end := pos + recordLengthWidth + int64(recLen)
+		if end > s.storeSize {
+			break // torn or corrupt tail: keep everything before it
+		}
+		positions = append(positions, uint64(pos))
+		pos = end
+	}
+	return positions, pos, nil
+}
+
+// rebuildIndex rewrites the index from a full log scan.
+func (s *Segment) rebuildIndex(logger *slog.Logger) error {
+	positions, canonicalSize, err := s.scanLog()
+	if err != nil {
+		return err
+	}
+	if canonicalSize < s.storeSize {
+		if err := s.store.Truncate(canonicalSize); err != nil {
+			return fmt.Errorf("commitlog: failed to truncate log: %w", err)
+		}
+		s.storeSize = canonicalSize
+	}
+	if err := s.index.rewrite(positions); err != nil {
+		return err
+	}
+	s.nextOffset = s.baseOffset + uint64(len(positions))
+	logger.Warn("commitlog: rebuilt index from log",
+		"segment", s.baseOffset, "records", len(positions))
+	return nil
+}
+
+// Append writes the record and its index entry and returns the assigned
+// absolute offset.
+func (s *Segment) Append(record Record) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.store == nil || s.index == nil {
+		return 0, ErrLogClosed
+	}
+
+	offset := s.nextOffset
+	position := s.storeSize
+
+	// Write length prefix and payload in a single write call.
+	buf := make([]byte, recordLengthWidth+len(record))
+	binary.BigEndian.PutUint64(buf, uint64(len(record)))
+	copy(buf[recordLengthWidth:], record)
+	n, err := s.store.Write(buf)
+	s.storeSize += int64(n)
+	if err != nil {
+		return 0, fmt.Errorf("commitlog: failed to write record at offset %d: %w", offset, err)
+	}
+
+	if err := s.index.WriteEntry(offset-s.baseOffset, uint64(position)); err != nil {
+		return 0, fmt.Errorf("commitlog: failed to index record at offset %d: %w", offset, err)
+	}
+
+	if s.fileSync {
+		if err := s.store.Sync(); err != nil {
+			return 0, fmt.Errorf("commitlog: failed to sync log file: %w", err)
+		}
+		if err := s.index.Sync(); err != nil {
+			return 0, fmt.Errorf("commitlog: failed to sync index file: %w", err)
+		}
+	}
+
+	s.nextOffset++
+	return offset, nil
+}
+
+// Read returns the record at the given absolute offset.
+func (s *Segment) Read(offset uint64) (Record, error) {
+	records, err := s.readBatch(offset, 1, 0, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, ErrOffsetNotFound
+	}
+	return records[0], nil
+}
+
+// ReadBatch reads up to maxRecords records starting at the absolute offset,
+// stopping when the segment ends or when the accumulated size would exceed
+// maxBytes (a single record larger than maxBytes is still returned so
+// consumers always make progress).
+func (s *Segment) ReadBatch(offset uint64, maxRecords int, maxBytes int) ([]Record, error) {
+	return s.readBatch(offset, maxRecords, maxBytes, true)
+}
+
+// readBatch implements the read paths above. When atLeastOne is false the
+// maxBytes limit is strict (used when the caller aggregates across segments).
+func (s *Segment) readBatch(offset uint64, maxRecords int, maxBytes int, atLeastOne bool) ([]Record, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.store == nil || s.index == nil {
+		return nil, ErrLogClosed
+	}
+	if offset < s.baseOffset || offset >= s.nextOffset {
+		return nil, ErrOffsetNotFound
+	}
+
+	position, err := s.index.ReadPositionForOffset(offset - s.baseOffset)
+	if err != nil {
+		return nil, err
+	}
+
+	records := make([]Record, 0, min(maxRecords, 64))
+	total := 0
+	lenBuf := make([]byte, recordLengthWidth)
+
+	for len(records) < maxRecords {
+		pos := int64(position)
+		if pos+recordLengthWidth > s.storeSize {
+			break // end of segment
+		}
+		if _, err := s.store.ReadAt(lenBuf, pos); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("commitlog: failed to read record length at %d: %w", pos, err)
+		}
+		recLen := binary.BigEndian.Uint64(lenBuf)
+		end := pos + recordLengthWidth + int64(recLen)
+		if end > s.storeSize {
+			return nil, fmt.Errorf("%w: record at position %d (len %d) runs past log size %d",
+				ErrCorruptSegment, pos, recLen, s.storeSize)
+		}
+		recSize := recordLengthWidth + int(recLen)
+		if maxBytes > 0 && total+recSize > maxBytes && !(atLeastOne && len(records) == 0) {
+			break
+		}
+		data := make(Record, recLen)
+		if _, err := s.store.ReadAt(data, pos+recordLengthWidth); err != nil {
+			return nil, fmt.Errorf("commitlog: failed to read record at %d: %w", pos, err)
+		}
+		records = append(records, data)
+		total += recSize
+		position = uint64(end)
+	}
+	return records, nil
+}
+
+func (s *Segment) IsFull() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.maxBytes > 0 && s.storeSize >= s.maxBytes
+}
+
+func (s *Segment) BaseOffset() uint64 { return s.baseOffset }
+
+func (s *Segment) NextOffset() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.nextOffset
+}
+
+func (s *Segment) Size() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.storeSize
 }
 
 func (s *Segment) logPath() string {
@@ -93,178 +329,38 @@ func (s *Segment) indexPath() string {
 	return filepath.Join(s.dir, fmt.Sprintf("%020d%s", s.baseOffset, indexSuffix))
 }
 
-func (s *Segment) Append(record Record) (absoluteOffset uint64, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.store == nil || s.index == nil {
-		return 0, ErrLogClosed
-	}
-
-	currentOffset := s.nextOffset
-	relativeOffset := currentOffset - s.baseOffset
-	currentPosition := s.storeSize
-
-	recordLen := uint64(len(record))
-	lenBuf := make([]byte, recordLengthWidth)
-	binary.BigEndian.PutUint64(lenBuf, recordLen)
-
-	n, err := s.store.Write(lenBuf)
-	if err != nil {
-		return 0, fmt.Errorf("failed to write record length to log %s: %w", s.store.Name(), err)
-	}
-	s.storeSize += int64(n)
-
-	n, err = s.store.Write(record)
-	if err != nil {
-
-		return 0, fmt.Errorf("failed to write record data to log %s: %w", s.store.Name(), err)
-	}
-	s.storeSize += int64(n)
-
-	err = s.index.WriteEntry(relativeOffset, uint64(currentPosition))
-	if err != nil {
-
-		return 0, fmt.Errorf("CRITICAL: failed to write index entry for offset %d (rel %d) at pos %d in %s: %w",
-			currentOffset, relativeOffset, currentPosition, s.index.Name(), err)
-	}
-
-	if s.fileSync {
-
-		if err := s.store.Sync(); err != nil {
-
-			return 0, fmt.Errorf("failed to sync log file %s: %w", s.store.Name(), err)
-		}
-
-		if err := s.index.Sync(); err != nil {
-			return 0, fmt.Errorf("failed to sync index file %s: %w", s.index.Name(), err)
-		}
-	}
-
-	s.nextOffset++
-
-	return currentOffset, nil
-}
-
-func (s *Segment) Read(absoluteOffset uint64) (Record, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.store == nil || s.index == nil {
-		return nil, ErrLogClosed
-	}
-
-	if absoluteOffset < s.baseOffset || absoluteOffset >= s.nextOffset {
-		return nil, ErrOffsetNotFound
-	}
-
-	relativeOffset := absoluteOffset - s.baseOffset
-
-	position, err := s.index.ReadPositionForOffset(relativeOffset)
-	if err != nil {
-
-		return nil, fmt.Errorf("failed to find index entry for offset %d (rel %d) in %s: %w",
-			absoluteOffset, relativeOffset, s.index.Name(), err)
-	}
-
-	lenBuf := make([]byte, recordLengthWidth)
-	_, err = s.store.ReadAt(lenBuf, int64(position))
-	if err != nil {
-		if err == io.EOF {
-
-			return nil, fmt.Errorf("read length failed (EOF) at pos %d for offset %d in %s: %w",
-				position, absoluteOffset, s.store.Name(), ErrReadPastEnd)
-		}
-		return nil, fmt.Errorf("failed to read record length at pos %d for offset %d in %s: %w",
-			position, absoluteOffset, s.store.Name(), err)
-	}
-	recordLen := binary.BigEndian.Uint64(lenBuf)
-
-	recordData := make(Record, recordLen)
-
-	dataPosition := int64(position) + int64(recordLengthWidth)
-	_, err = s.store.ReadAt(recordData, dataPosition)
-	if err != nil {
-		if err == io.EOF {
-
-			return nil, fmt.Errorf("read data failed (EOF) at pos %d for offset %d (len %d) in %s: %w",
-				dataPosition, absoluteOffset, recordLen, s.store.Name(), ErrReadPastEnd)
-		}
-		return nil, fmt.Errorf("failed to read record data at pos %d for offset %d (len %d) in %s: %w",
-			dataPosition, absoluteOffset, recordLen, s.store.Name(), err)
-	}
-
-	return recordData, nil
-}
-
-func (s *Segment) IsFull() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	return s.maxBytes > 0 && s.storeSize >= s.maxBytes
-}
-
+// Close flushes (best effort) and closes both files.
 func (s *Segment) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var storeErr, indexErr error
-
+	var errs []error
 	if s.index != nil {
-		indexErr = s.index.Close()
+		if err := s.index.Close(); err != nil {
+			errs = append(errs, err)
+		}
 		s.index = nil
 	}
 	if s.store != nil {
-
-		if !s.fileSync {
-			if syncErr := s.store.Sync(); syncErr != nil {
-
-				fmt.Fprintf(os.Stderr, "Warning: failed to sync log file %s on close: %v\n", s.store.Name(), syncErr)
-			}
+		if err := s.store.Sync(); err != nil {
+			errs = append(errs, fmt.Errorf("sync on close: %w", err))
 		}
-		storeErr = s.store.Close()
+		if err := s.store.Close(); err != nil {
+			errs = append(errs, err)
+		}
 		s.store = nil
 	}
-
-	if storeErr != nil || indexErr != nil {
-		return fmt.Errorf("error closing segment %d: store_err=%w, index_err=%w", s.baseOffset, storeErr, indexErr)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
-func (s *Segment) BaseOffset() uint64 {
-
-	return s.baseOffset
-}
-
-func (s *Segment) NextOffset() uint64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.nextOffset
-}
-
+// Remove deletes the segment's files. The segment must be closed first.
 func (s *Segment) Remove() error {
-
-	logPath := s.logPath()
-	indexPath := s.indexPath()
-
-	var rmLogErr, rmIndexErr error
-
-	if err := os.Remove(logPath); err != nil && !os.IsNotExist(err) {
-		rmLogErr = fmt.Errorf("failed to remove log file %s: %w", logPath, err)
+	var errs []error
+	if err := os.Remove(s.logPath()); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
 	}
-
-	if err := os.Remove(indexPath); err != nil && !os.IsNotExist(err) {
-		rmIndexErr = fmt.Errorf("failed to remove index file %s: %w", indexPath, err)
+	if err := os.Remove(s.indexPath()); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
 	}
-
-	if rmLogErr != nil || rmIndexErr != nil {
-		return fmt.Errorf("error removing segment %d files: log_err=%w, index_err=%w", s.baseOffset, rmLogErr, rmIndexErr)
-	}
-	return nil
-}
-
-func (s *Segment) SanityCheck() error {
-
-	return nil
+	return errors.Join(errs...)
 }

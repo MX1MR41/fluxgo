@@ -1,137 +1,135 @@
+// Package offset persists consumer-group offsets: for each
+// (group, topic, partition) the broker stores the next offset the group
+// should consume, so consumers can resume after restarts.
+//
+// Layout: <dataDir>/__consumer_offsets/<groupID>/<topic>_<partition>.offset
+// Each .offset file holds the 8-byte big-endian offset. Commits are written
+// to a temp file, fsynced, then atomically renamed.
 package offset
 
 import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+
+	"github.com/MX1MR41/fluxgo/internal/validate"
 )
 
-var (
-	ErrOffsetNotFound = errors.New("committed offset not found")
-)
+// ErrOffsetNotFound is returned when no offset was committed for the
+// (group, topic, partition) triple.
+var ErrOffsetNotFound = errors.New("offset: no committed offset")
 
 const (
-	offsetFileExtension = ".offset"
-	tempFileSuffix      = ".tmp"
-	offsetsDirName      = "__consumer_offsets"
+	offsetFileExt = ".offset"
+	tempFileExt   = ".tmp"
+	offsetsDir    = "__consumer_offsets"
 )
 
+// Manager stores and fetches committed offsets on disk.
 type Manager struct {
-	mu      sync.RWMutex
 	baseDir string
+	logger  *slog.Logger
+	mu      sync.RWMutex
 }
 
-func NewManager(dataDir string) (*Manager, error) {
-	offsetBaseDir := filepath.Join(dataDir, offsetsDirName)
-	if err := os.MkdirAll(offsetBaseDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create consumer offsets directory '%s': %w", offsetBaseDir, err)
+// NewManager creates the offsets directory inside dataDir.
+func NewManager(dataDir string, logger *slog.Logger) (*Manager, error) {
+	if logger == nil {
+		logger = slog.Default()
 	}
-
-	fmt.Printf("Offset Manager: Initialized. Storing offsets in %s\n", offsetBaseDir)
-	return &Manager{
-		baseDir: offsetBaseDir,
-	}, nil
+	base := filepath.Join(dataDir, offsetsDir)
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return nil, fmt.Errorf("offset: failed to create offsets directory %s: %w", base, err)
+	}
+	return &Manager{baseDir: base, logger: logger}, nil
 }
 
-func (m *Manager) getOffsetFilePath(groupID, topic string, partition uint64) (string, error) {
-
-	if strings.Contains(groupID, "..") || strings.ContainsAny(groupID, "/\\") {
-		return "", fmt.Errorf("invalid characters in groupID: %s", groupID)
+func (m *Manager) pathFor(groupID, topic string, partition uint32) (string, error) {
+	if err := validate.GroupID(groupID); err != nil {
+		return "", err
 	}
-	if strings.Contains(topic, "..") || strings.ContainsAny(topic, "/\\") {
-		return "", fmt.Errorf("invalid characters in topic name: %s", topic)
+	if err := validate.Topic(topic); err != nil {
+		return "", err
 	}
-	if groupID == "" || topic == "" {
-		return "", fmt.Errorf("groupID and topic cannot be empty")
-	}
-
-	groupDir := filepath.Join(m.baseDir, groupID)
-	fileName := fmt.Sprintf("%s_%d%s", topic, partition, offsetFileExtension)
-	return filepath.Join(groupDir, fileName), nil
+	file := fmt.Sprintf("%s_%d%s", topic, partition, offsetFileExt)
+	return filepath.Join(m.baseDir, groupID, file), nil
 }
 
-func (m *Manager) Commit(groupID, topic string, partition uint64, offset uint64) error {
+// Commit durably records offset for the (group, topic, partition) triple.
+func (m *Manager) Commit(groupID, topic string, partition uint32, offset uint64) error {
+	path, err := m.pathFor(groupID, topic, partition)
+	if err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	filePath, err := m.getOffsetFilePath(groupID, topic, partition)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("offset: failed to create group directory: %w", err)
+	}
+
+	tmp := path + tempFileExt
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
 	if err != nil {
-		return fmt.Errorf("failed to get offset file path: %w", err)
+		return fmt.Errorf("offset: failed to open temp file: %w", err)
 	}
-
-	groupDir := filepath.Dir(filePath)
-	if err := os.MkdirAll(groupDir, 0755); err != nil {
-		return fmt.Errorf("failed to create group directory '%s': %w", groupDir, err)
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], offset)
+	if _, err := f.Write(buf[:]); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("offset: failed to write temp file: %w", err)
 	}
-
-	tempFilePath := filePath + tempFileSuffix
-	file, err := os.OpenFile(tempFilePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-	if err != nil {
-		return fmt.Errorf("failed to open temporary offset file '%s': %w", tempFilePath, err)
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("offset: failed to sync temp file: %w", err)
 	}
-
-	offsetBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(offsetBytes, offset)
-
-	_, err = file.Write(offsetBytes)
-	if err != nil {
-		file.Close()
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to write offset to temporary file '%s': %w", tempFilePath, err)
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("offset: failed to close temp file: %w", err)
 	}
-
-	if err := file.Sync(); err != nil {
-		file.Close()
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to sync temporary offset file '%s': %w", tempFilePath, err)
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("offset: failed to rename temp file: %w", err)
 	}
-
-	if err := file.Close(); err != nil {
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to close temporary offset file '%s': %w", tempFilePath, err)
+	// Best effort: fsync the directory so the rename itself survives a crash.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		d.Close()
 	}
-
-	if err := os.Rename(tempFilePath, filePath); err != nil {
-
-		os.Remove(tempFilePath)
-		return fmt.Errorf("failed to rename temporary offset file '%s' to '%s': %w", tempFilePath, filePath, err)
-	}
-
 	return nil
 }
 
-func (m *Manager) Fetch(groupID, topic string, partition uint64) (uint64, error) {
+// Fetch returns the committed offset for the (group, topic, partition)
+// triple, or ErrOffsetNotFound.
+func (m *Manager) Fetch(groupID, topic string, partition uint32) (uint64, error) {
+	path, err := m.pathFor(groupID, topic, partition)
+	if err != nil {
+		return 0, err
+	}
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	filePath, err := m.getOffsetFilePath(groupID, topic, partition)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get offset file path: %w", err)
-	}
-
-	file, err := os.Open(filePath)
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, ErrOffsetNotFound
 		}
-		return 0, fmt.Errorf("failed to open offset file '%s': %w", filePath, err)
+		return 0, fmt.Errorf("offset: failed to open offset file: %w", err)
 	}
-	defer file.Close()
+	defer f.Close()
 
-	offsetBytes := make([]byte, 8)
-	n, err := file.Read(offsetBytes)
-	if err != nil {
-		return 0, fmt.Errorf("failed to read offset from file '%s': %w", filePath, err)
+	var buf [8]byte
+	if _, err := io.ReadFull(f, buf[:]); err != nil {
+		return 0, fmt.Errorf("offset: offset file %s is corrupt: %w", path, err)
 	}
-	if n < 8 {
-		return 0, fmt.Errorf("offset file '%s' is corrupted (too short)", filePath)
-	}
-
-	committedOffset := binary.BigEndian.Uint64(offsetBytes)
-
-	return committedOffset, nil
+	return binary.BigEndian.Uint64(buf[:]), nil
 }

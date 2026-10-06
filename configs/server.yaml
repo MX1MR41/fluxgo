@@ -1,10 +1,12 @@
+# FluxGo broker configuration (V2).
 server:
-  listen_address: ":9898" 
-  read_timeout: 60s      
-  write_timeout: 60s     
+  listen_address: ":9898"   # TCP address the broker listens on
+  read_timeout: 60s         # max wait for a complete request frame
+  write_timeout: 60s        # max wait writing a response frame
+  max_frame_bytes: 16777216 # 16 MiB; bounds a single request/message
 
 log:
-  data_dir: ./fluxgo-data 
-  max_segment_bytes: 33554432 
-  max_log_bytes: 2147483648  
-  file_sync: true          
+  data_dir: ./fluxgo-data       # base directory for all topic-partition logs
+  max_segment_bytes: 33554432   # 32 MiB; roll to a new segment past this size
+  max_log_bytes: 2147483648     # 2 GiB per partition; oldest segments deleted past this (0 disables)
+  file_sync: true               # fsync after every append (durable but slower)

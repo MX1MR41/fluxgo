@@ -1,4 +1,9 @@
-go.sum
-fluxgo-client.exe
-fluxgo-server.exe
+# Data directories
 fluxgo-data/
+data/
+
+# Binaries
+*.exe
+
+# Go
+vendor/

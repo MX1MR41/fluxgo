@@ -2,291 +2,280 @@ package broker
 
 import (
 	"bufio"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
-	"os"
 	"time"
 
 	clog "github.com/MX1MR41/fluxgo/internal/commitlog"
-	offset "github.com/MX1MR41/fluxgo/internal/offset"
+	"github.com/MX1MR41/fluxgo/internal/offset"
 	proto "github.com/MX1MR41/fluxgo/internal/protocol"
-	store "github.com/MX1MR41/fluxgo/internal/store"
+	"github.com/MX1MR41/fluxgo/internal/store"
+	"github.com/MX1MR41/fluxgo/internal/validate"
 )
 
+// Hard caps applied to fetch requests regardless of what the client asks for.
+const (
+	maxFetchRecords = 4096
+	maxFetchBytes   = 32 * 1024 * 1024
+)
+
+// Handler serves a single client connection.
 type Handler struct {
 	store         *store.Store
 	offsetManager *offset.Manager
+	logger        *slog.Logger
+	maxFrameBytes uint32
+	readTimeout   time.Duration
+	writeTimeout  time.Duration
 }
 
-func NewHandler(s *store.Store, om *offset.Manager) *Handler {
+// NewHandler builds a Handler.
+func NewHandler(s *store.Store, om *offset.Manager, logger *slog.Logger,
+	maxFrameBytes int64, readTimeout, writeTimeout time.Duration) *Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Handler{
 		store:         s,
 		offsetManager: om,
+		logger:        logger,
+		maxFrameBytes: uint32(maxFrameBytes),
+		readTimeout:   readTimeout,
+		writeTimeout:  writeTimeout,
 	}
 }
 
-func (h *Handler) Handle(conn net.Conn, readTimeout, writeTimeout time.Duration) {
-	remoteAddr := conn.RemoteAddr().String()
-	fmt.Printf("Handler: Handling connection from %s\n", remoteAddr)
-	defer fmt.Printf("Handler: Finished handling connection from %s\n", remoteAddr)
+// Handle processes requests on conn until the peer disconnects, a protocol
+// error occurs, or the broker shuts down. A panic while serving one
+// connection is contained: it is logged and the connection is dropped, but
+// the broker keeps running.
+func (h *Handler) Handle(conn net.Conn) {
+	remote := conn.RemoteAddr().String()
+	log := h.logger.With("remote", remote)
+	log.Debug("connection opened")
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("panic while serving connection, dropping it", "panic", r)
+		}
+		log.Debug("connection closed")
+	}()
 
 	reader := bufio.NewReader(conn)
-
 	for {
-
-		if readTimeout > 0 {
-			conn.SetReadDeadline(time.Now().Add(readTimeout))
+		if h.readTimeout > 0 {
+			conn.SetReadDeadline(time.Now().Add(h.readTimeout))
 		}
-
-		lenBuf := make([]byte, proto.LenPrefixSize)
-		_, err := io.ReadFull(reader, lenBuf)
+		code, payload, err := h.readRequest(reader)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-
-			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				fmt.Printf("Handler: Read timeout for %s\n", remoteAddr)
-			} else {
-				fmt.Fprintf(os.Stderr, "Handler: Error reading length prefix from %s: %v\n", remoteAddr, err)
-			}
-			return
-		}
-		messageLen := binary.BigEndian.Uint32(lenBuf)
-
-		if messageLen > 1024*1024*10 {
-			fmt.Fprintf(os.Stderr, "Handler: Message length %d exceeds limit from %s\n", messageLen, remoteAddr)
-			return
-		}
-		if messageLen < proto.CmdCodeSize {
-			fmt.Fprintf(os.Stderr, "Handler: Message length %d too short from %s\n", messageLen, remoteAddr)
-			return
-		}
-
-		payloadWithCmd := make([]byte, messageLen)
-		_, err = io.ReadFull(reader, payloadWithCmd)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				fmt.Printf("Handler: Read timeout while reading payload from %s\n", remoteAddr)
-			} else {
-				fmt.Fprintf(os.Stderr, "Handler: Error reading command/payload from %s: %v\n", remoteAddr, err)
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !isTimeout(err) {
+				log.Warn("failed to read request", "error", err)
 			}
 			return
 		}
 
-		commandCode := payloadWithCmd[0]
-		payload := payloadWithCmd[1:]
+		respCode, respPayload := h.dispatch(code, payload, log)
 
-		var responsePayload []byte
-		var responseErrCode byte
+		if h.writeTimeout > 0 {
+			conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
+		}
+		if err := proto.WriteFrame(conn, respCode, respPayload); err != nil {
+			if !errors.Is(err, net.ErrClosed) && !isTimeout(err) {
+				log.Warn("failed to write response", "error", err)
+			}
+			return
+		}
+	}
+}
 
-		switch commandCode {
-		case proto.CmdProduce:
-			responsePayload, responseErrCode = h.handleProduce(payload)
-		case proto.CmdConsume:
-			responsePayload, responseErrCode = h.handleConsume(payload)
-		case proto.CmdCommitOffset:
-			responsePayload, responseErrCode = h.handleCommitOffset(payload)
-		case proto.CmdFetchOffset:
-			responsePayload, responseErrCode = h.handleFetchOffset(payload)
+// readRequest reads one request frame and enforces the frame size limit.
+func (h *Handler) readRequest(reader *bufio.Reader) (byte, []byte, error) {
+	code, payload, err := proto.ReadFrame(reader, h.maxFrameBytes)
+	if err != nil {
+		return 0, nil, err
+	}
+	return code, payload, nil
+}
+
+func (h *Handler) dispatch(cmd byte, payload []byte, log *slog.Logger) (byte, []byte) {
+	switch cmd {
+	case proto.CmdProduce:
+		return h.handleProduce(payload, log)
+	case proto.CmdFetch:
+		return h.handleFetch(payload, log)
+	case proto.CmdCommitOffset:
+		return h.handleCommitOffset(payload, log)
+	case proto.CmdFetchOffset:
+		return h.handleFetchOffset(payload, log)
+	case proto.CmdListTopics:
+		return h.handleListTopics()
+	default:
+		return proto.ErrCodeUnknownCommand, []byte(fmt.Sprintf("unknown command 0x%X", cmd))
+	}
+}
+
+// handleProduce: [u16 topic][u32 partition][u32 msgLen][msg] -> [u64 offset].
+func (h *Handler) handleProduce(payload []byte, log *slog.Logger) (byte, []byte) {
+	d := proto.NewDecoder(payload)
+	topic := d.String()
+	partition := d.Uint32()
+	message := d.Bytes()
+	if err := d.Err(); err != nil {
+		return proto.ErrCodeMalformedRequest, []byte("malformed produce request")
+	}
+
+	lg, err := h.store.GetOrCreateLog(topic, partition)
+	if err != nil {
+		log.Warn("produce: cannot get/create log", "topic", topic, "partition", partition, "error", err)
+		if isInvalidName(err) {
+			return proto.ErrCodeInvalidTopic, []byte(err.Error())
+		}
+		return proto.ErrCodeInternal, []byte("failed to access log")
+	}
+
+	offset, err := lg.Append(clog.Record(message))
+	if err != nil {
+		log.Error("produce: append failed", "topic", topic, "partition", partition, "error", err)
+		return proto.ErrCodeInternal, []byte("failed to append message")
+	}
+
+	resp := proto.NewEncoder(proto.OffsetSize)
+	resp.Uint64(offset)
+	return proto.ErrCodeNone, resp.Payload()
+}
+
+// handleFetch: [u16 topic][u32 partition][u64 offset][u32 maxRecords][u32 maxBytes]
+// -> [u64 highWatermark][u64 startOffset][u32 count][u32 len + record]...
+//
+// Offset errors carry watermarks so clients can resync:
+// past-end -> [u64 highWatermark], out-of-range -> [u64 lowWatermark].
+func (h *Handler) handleFetch(payload []byte, log *slog.Logger) (byte, []byte) {
+	d := proto.NewDecoder(payload)
+	topic := d.String()
+	partition := d.Uint32()
+	offset := d.Uint64()
+	maxRecords := int(d.Uint32())
+	maxBytes := int(d.Uint32())
+	if err := d.Err(); err != nil {
+		return proto.ErrCodeMalformedRequest, []byte("malformed fetch request")
+	}
+
+	lg := h.store.GetLog(topic, partition)
+	if lg == nil {
+		return proto.ErrCodeTopicNotFound, []byte("topic or partition not found")
+	}
+
+	if maxRecords < 1 {
+		maxRecords = 1
+	}
+	maxRecords = min(maxRecords, maxFetchRecords)
+	if maxBytes <= 0 || maxBytes > maxFetchBytes {
+		maxBytes = maxFetchBytes
+	}
+
+	records, err := lg.ReadBatch(offset, maxRecords, maxBytes)
+	if err != nil {
+		switch {
+		case errors.Is(err, clog.ErrOffsetOutOfRange):
+			resp := proto.NewEncoder(proto.OffsetSize)
+			resp.Uint64(lg.LowestOffset())
+			return proto.ErrCodeOffsetOutOfRange, resp.Payload()
+		case errors.Is(err, clog.ErrReadPastEnd):
+			resp := proto.NewEncoder(proto.OffsetSize)
+			resp.Uint64(lg.HighestOffset())
+			return proto.ErrCodeOffsetPastEnd, resp.Payload()
+		case errors.Is(err, clog.ErrLogClosed):
+			return proto.ErrCodeUnavailable, []byte("log is closed")
 		default:
-			fmt.Fprintf(os.Stderr, "Handler: Unknown command code 0x%X from %s\n", commandCode, remoteAddr)
-			responseErrCode = proto.ErrCodeUnknownCommand
-			responsePayload = []byte("Unknown command code")
-		}
-
-		respLen := uint32(proto.ErrCodeSize + len(responsePayload))
-		respBuf := make([]byte, proto.LenPrefixSize+respLen)
-
-		binary.BigEndian.PutUint32(respBuf[0:proto.LenPrefixSize], respLen)
-		respBuf[proto.LenPrefixSize] = responseErrCode
-		copy(respBuf[proto.LenPrefixSize+proto.ErrCodeSize:], responsePayload)
-
-		if writeTimeout > 0 {
-			conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-		}
-		_, err = conn.Write(respBuf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				fmt.Printf("Handler: Write timeout for %s\n", remoteAddr)
-			} else {
-				fmt.Fprintf(os.Stderr, "Handler: Error writing response to %s: %v\n", remoteAddr, err)
-			}
-			return
+			log.Error("fetch: read failed", "topic", topic, "partition", partition,
+				"offset", offset, "error", err)
+			return proto.ErrCodeInternal, []byte("failed to read")
 		}
 	}
+
+	size := proto.OffsetSize*2 + proto.CountSize
+	for _, rec := range records {
+		size += proto.RecordLenSize + len(rec)
+	}
+	resp := proto.NewEncoder(size)
+	resp.Uint64(lg.HighestOffset()) // high watermark
+	resp.Uint64(offset)             // offset of the first record
+	resp.Uint32(uint32(len(records)))
+	for _, rec := range records {
+		resp.Bytes(rec)
+	}
+	return proto.ErrCodeNone, resp.Payload()
 }
 
-func (h *Handler) handleProduce(payload []byte) (responsePayload []byte, errorCode byte) {
-	fmt.Println("Handler: Received Produce request")
-
-	minLen := proto.TopicLenSize + proto.PartitionIDSize
-	if len(payload) < minLen {
-		return []byte("Invalid produce payload: too short"), proto.ErrCodePayloadTooShort
+// handleCommitOffset: [u16 group][u16 topic][u32 partition][u64 offset] -> (empty).
+func (h *Handler) handleCommitOffset(payload []byte, log *slog.Logger) (byte, []byte) {
+	d := proto.NewDecoder(payload)
+	group := d.String()
+	topic := d.String()
+	partition := d.Uint32()
+	off := d.Uint64()
+	if err := d.Err(); err != nil {
+		return proto.ErrCodeMalformedRequest, []byte("malformed commit request")
 	}
 
-	topicLen := int(binary.BigEndian.Uint16(payload[0:proto.TopicLenSize]))
-	if len(payload) < minLen+topicLen {
-		return []byte("Invalid produce payload: too short for topic"), proto.ErrCodeProduceTopicLen
-	}
-	topicName := string(payload[proto.TopicLenSize : proto.TopicLenSize+topicLen])
-
-	partitionOffset := proto.TopicLenSize + topicLen
-	partitionID := binary.BigEndian.Uint64(payload[partitionOffset : partitionOffset+proto.PartitionIDSize])
-
-	messageDataOffset := partitionOffset + proto.PartitionIDSize
-	if messageDataOffset > len(payload) {
-		return []byte("Invalid produce payload: missing message data"), proto.ErrCodeProduceMissingData
-	}
-	messageData := payload[messageDataOffset:]
-
-	log, err := h.store.GetOrCreateLog(topicName, partitionID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Handler: Failed to get/create log for %s_%d: %v\n", topicName, partitionID, err)
-		return []byte(fmt.Sprintf("Failed to access log: %s", err)), proto.ErrCodeProduceLogAccess
-	}
-
-	offset, err := log.Append(clog.Record(messageData))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Handler: Failed to append to log %s_%d: %v\n", topicName, partitionID, err)
-		return []byte(fmt.Sprintf("Failed to append message: %s", err)), proto.ErrCodeProduceAppendFailed
-	}
-
-	respData := make([]byte, proto.OffsetSize)
-	binary.BigEndian.PutUint64(respData, offset)
-
-	fmt.Printf("Handler: Produced to %s_%d at offset %d\n", topicName, partitionID, offset)
-	return respData, proto.ErrCodeNone
-}
-
-func (h *Handler) handleConsume(payload []byte) (responsePayload []byte, errorCode byte) {
-	fmt.Println("Handler: Received Consume request")
-
-	if len(payload) < proto.TopicLenSize {
-		return []byte("Invalid consume payload: too short for topic length"), proto.ErrCodePayloadTooShort
-	}
-
-	topicLen := int(binary.BigEndian.Uint16(payload[0:proto.TopicLenSize]))
-	expectedLen := proto.TopicLenSize + topicLen + proto.PartitionIDSize + proto.OffsetSize
-	if len(payload) < expectedLen {
-		return []byte("Invalid consume payload: too short for full header"), proto.ErrCodeConsumeTopicLen
-	}
-	topicName := string(payload[proto.TopicLenSize : proto.TopicLenSize+topicLen])
-
-	partitionOffset := proto.TopicLenSize + topicLen
-	partitionID := binary.BigEndian.Uint64(payload[partitionOffset : partitionOffset+proto.PartitionIDSize])
-
-	offsetOffset := partitionOffset + proto.PartitionIDSize
-	requestedOffset := binary.BigEndian.Uint64(payload[offsetOffset : offsetOffset+proto.OffsetSize])
-
-	log := h.store.GetLog(topicName, partitionID)
-	if log == nil {
-		return []byte("Topic or partition not found"), proto.ErrCodeConsumeTopicNotFound
-	}
-
-	record, err := log.Read(requestedOffset)
-	if err != nil {
-		if errors.Is(err, clog.ErrOffsetNotFound) || errors.Is(err, clog.ErrReadPastEnd) {
-			fmt.Printf("Handler: Consume request for offset %d on %s_%d: Offset not found/past end.\n",
-				requestedOffset, topicName, partitionID)
-			return nil, proto.ErrCodeConsumeOffsetInvalid
+	if err := h.offsetManager.Commit(group, topic, partition, off); err != nil {
+		if isInvalidName(err) {
+			return proto.ErrCodeInvalidTopic, []byte(err.Error())
 		}
-		fmt.Fprintf(os.Stderr, "Handler: Failed to read from log %s_%d at offset %d: %v\n",
-			topicName, partitionID, requestedOffset, err)
-		return []byte(fmt.Sprintf("Failed to read message: %s", err)), proto.ErrCodeConsumeReadFailed
+		log.Error("offset commit failed", "group", group, "topic", topic,
+			"partition", partition, "error", err)
+		return proto.ErrCodeInternal, []byte("failed to commit offset")
 	}
-
-	fmt.Printf("Handler: Consumed from %s_%d at offset %d (size %d)\n",
-		topicName, partitionID, requestedOffset, len(record))
-	return record, proto.ErrCodeNone
+	return proto.ErrCodeNone, nil
 }
 
-func (h *Handler) handleCommitOffset(payload []byte) (responsePayload []byte, errorCode byte) {
-
-	if len(payload) < proto.GroupIDLenSize+proto.TopicLenSize+proto.PartitionIDSize+proto.OffsetSize {
-		return []byte("Invalid commit payload: too short for headers"), proto.ErrCodePayloadTooShort
+// handleFetchOffset: [u16 group][u16 topic][u32 partition] -> [u64 offset].
+func (h *Handler) handleFetchOffset(payload []byte, log *slog.Logger) (byte, []byte) {
+	d := proto.NewDecoder(payload)
+	group := d.String()
+	topic := d.String()
+	partition := d.Uint32()
+	if err := d.Err(); err != nil {
+		return proto.ErrCodeMalformedRequest, []byte("malformed fetch-offset request")
 	}
 
-	cursor := 0
-	groupIDLen := int(binary.BigEndian.Uint16(payload[cursor : cursor+proto.GroupIDLenSize]))
-	cursor += proto.GroupIDLenSize
-	if len(payload) < cursor+groupIDLen+proto.TopicLenSize+proto.PartitionIDSize+proto.OffsetSize {
-		return []byte("Invalid commit payload: too short for group ID"), proto.ErrCodeOffsetGroupIDLen
-	}
-	groupID := string(payload[cursor : cursor+groupIDLen])
-	cursor += groupIDLen
-
-	topicLen := int(binary.BigEndian.Uint16(payload[cursor : cursor+proto.TopicLenSize]))
-	cursor += proto.TopicLenSize
-	if len(payload) < cursor+topicLen+proto.PartitionIDSize+proto.OffsetSize {
-		return []byte("Invalid commit payload: too short for topic"), proto.ErrCodeOffsetTopicLen
-	}
-	topicName := string(payload[cursor : cursor+topicLen])
-	cursor += topicLen
-
-	if len(payload) < cursor+proto.PartitionIDSize+proto.OffsetSize {
-		return []byte("Invalid commit payload: too short for partition/offset"), proto.ErrCodePayloadTooShort
-	}
-	partitionID := binary.BigEndian.Uint64(payload[cursor : cursor+proto.PartitionIDSize])
-	cursor += proto.PartitionIDSize
-
-	committedOffset := binary.BigEndian.Uint64(payload[cursor : cursor+proto.OffsetSize])
-	cursor += proto.OffsetSize
-
-	err := h.offsetManager.Commit(groupID, topicName, partitionID, committedOffset)
+	off, err := h.offsetManager.Fetch(group, topic, partition)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Handler: Failed to commit offset %d for %s/%s_%d: %v\n",
-			committedOffset, groupID, topicName, partitionID, err)
-		return []byte("Failed to commit offset"), proto.ErrCodeOffsetCommitFailed
-	}
-
-	return nil, proto.ErrCodeNone
-}
-
-func (h *Handler) handleFetchOffset(payload []byte) (responsePayload []byte, errorCode byte) {
-
-	if len(payload) < proto.GroupIDLenSize+proto.TopicLenSize+proto.PartitionIDSize {
-		return []byte("Invalid fetch payload: too short for headers"), proto.ErrCodePayloadTooShort
-	}
-
-	cursor := 0
-	groupIDLen := int(binary.BigEndian.Uint16(payload[cursor : cursor+proto.GroupIDLenSize]))
-	cursor += proto.GroupIDLenSize
-	if len(payload) < cursor+groupIDLen+proto.TopicLenSize+proto.PartitionIDSize {
-		return []byte("Invalid fetch payload: too short for group ID"), proto.ErrCodeOffsetGroupIDLen
-	}
-	groupID := string(payload[cursor : cursor+groupIDLen])
-	cursor += groupIDLen
-
-	topicLen := int(binary.BigEndian.Uint16(payload[cursor : cursor+proto.TopicLenSize]))
-	cursor += proto.TopicLenSize
-	if len(payload) < cursor+topicLen+proto.PartitionIDSize {
-		return []byte("Invalid fetch payload: too short for topic"), proto.ErrCodeOffsetTopicLen
-	}
-	topicName := string(payload[cursor : cursor+topicLen])
-	cursor += topicLen
-
-	if len(payload) < cursor+proto.PartitionIDSize {
-		return []byte("Invalid fetch payload: too short for partition"), proto.ErrCodePayloadTooShort
-	}
-	partitionID := binary.BigEndian.Uint64(payload[cursor : cursor+proto.PartitionIDSize])
-	cursor += proto.PartitionIDSize
-
-	fetchedOffset, err := h.offsetManager.Fetch(groupID, topicName, partitionID)
-	if err != nil {
-		if errors.Is(err, offset.ErrOffsetNotFound) {
-
-			return nil, proto.ErrCodeOffsetNotFound
+		switch {
+		case errors.Is(err, offset.ErrOffsetNotFound):
+			return proto.ErrCodeOffsetNotFound, nil
+		case isInvalidName(err):
+			return proto.ErrCodeInvalidTopic, []byte(err.Error())
+		default:
+			log.Error("offset fetch failed", "group", group, "topic", topic,
+				"partition", partition, "error", err)
+			return proto.ErrCodeInternal, []byte("failed to fetch offset")
 		}
-
-		fmt.Fprintf(os.Stderr, "Handler: Failed to fetch offset for %s/%s_%d: %v\n",
-			groupID, topicName, partitionID, err)
-		return []byte("Failed to fetch offset"), proto.ErrCodeOffsetFetchFailed
 	}
 
-	respData := make([]byte, proto.OffsetSize)
-	binary.BigEndian.PutUint64(respData, fetchedOffset)
+	resp := proto.NewEncoder(proto.OffsetSize)
+	resp.Uint64(off)
+	return proto.ErrCodeNone, resp.Payload()
+}
 
-	return respData, proto.ErrCodeNone
+// handleListTopics: (empty) -> [u16 count][u16 len + topic]...
+func (h *Handler) handleListTopics() (byte, []byte) {
+	topics := h.store.Topics()
+	resp := proto.NewEncoder(64)
+	resp.Uint16(uint16(len(topics)))
+	for _, t := range topics {
+		resp.String(t)
+	}
+	return proto.ErrCodeNone, resp.Payload()
+}
+
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isInvalidName(err error) bool {
+	return errors.Is(err, validate.ErrInvalidName)
 }

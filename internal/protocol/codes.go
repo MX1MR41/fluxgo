@@ -1,81 +1,85 @@
+// Package protocol defines the FluxGo binary wire format (V2) and the
+// helpers used by both the broker and clients to encode and decode frames.
+//
+// Frame layout (all integers are big-endian):
+//
+//	Request:  [4B length N][1B command code][N-1 bytes payload]
+//	Response: [4B length M][1B error code][M-1 bytes payload]
+//
+// The length prefix covers the command/error code byte plus the payload.
 package protocol
 
-import "fmt"
-
+// Field widths used throughout the protocol.
 const (
-	CmdProduce      byte = 0x01
-	CmdConsume      byte = 0x02
-	CmdCommitOffset byte = 0x04
-	CmdFetchOffset  byte = 0x05
+	LenPrefixSize   = 4
+	CodeSize        = 1 // command code (request) / error code (response)
+	TopicLenSize    = 2
+	GroupIDLenSize  = 2
+	PartitionIDSize = 4
+	OffsetSize      = 8
+	CountSize       = 4
+	RecordLenSize   = 4
 )
 
+// DefaultMaxFrameBytes bounds a single frame. The broker enforces its own
+// configured limit; this is the fallback used by clients.
+const DefaultMaxFrameBytes = 16 * 1024 * 1024
+
+// Command codes (request frame, first byte after the length prefix).
 const (
-	ErrCodeNone            byte = 0x00
-	ErrCodeUnknown         byte = 0xFF
-	ErrCodeUnknownCommand  byte = 0xFE
-	ErrCodeInvalidRequest  byte = 0xFD
-	ErrCodePayloadTooShort byte = 0xFC
-	ErrCodeMessageTooLarge byte = 0xFB
-
-	ErrCodeProduceTopicLen     byte = 0x11
-	ErrCodeProduceMissingData  byte = 0x12
-	ErrCodeProduceLogAccess    byte = 0x13
-	ErrCodeProduceAppendFailed byte = 0x14
-
-	ErrCodeConsumeTopicLen      byte = 0x21
-	ErrCodeConsumeTopicNotFound byte = 0x22
-	ErrCodeConsumeOffsetInvalid byte = 0x23
-	ErrCodeConsumeReadFailed    byte = 0x24
-
-	ErrCodeOffsetGroupIDLen   byte = 0x30
-	ErrCodeOffsetTopicLen     byte = 0x31
-	ErrCodeOffsetCommitFailed byte = 0x32
-	ErrCodeOffsetFetchFailed  byte = 0x33
-	ErrCodeOffsetNotFound     byte = 0x34
+	CmdProduce      byte = 0x01 // append one record, returns its offset
+	CmdFetch        byte = 0x02 // read a batch of records starting at an offset
+	CmdCommitOffset byte = 0x03 // persist a consumer-group offset
+	CmdFetchOffset  byte = 0x04 // read back a consumer-group offset
+	CmdListTopics   byte = 0x05 // metadata: list known topics
 )
 
+// Error codes (response frame, first byte after the length prefix).
+const (
+	ErrCodeNone             byte = 0x00
+	ErrCodeUnknownCommand   byte = 0x01
+	ErrCodeMalformedRequest byte = 0x02
+	ErrCodeMessageTooLarge  byte = 0x03
+	ErrCodeInvalidTopic     byte = 0x04
+	ErrCodeTopicNotFound    byte = 0x05
+	// ErrCodeOffsetOutOfRange means the requested offset is older than the
+	// earliest record still retained. The payload carries the low watermark.
+	ErrCodeOffsetOutOfRange byte = 0x06
+	// ErrCodeOffsetPastEnd means the requested offset is at or beyond the
+	// next offset to be assigned, i.e. there is no new data yet. The payload
+	// carries the high watermark. This is a normal polling outcome.
+	ErrCodeOffsetPastEnd  byte = 0x07
+	ErrCodeOffsetNotFound byte = 0x08 // no committed offset for the group
+	ErrCodeInternal       byte = 0x09
+	ErrCodeUnavailable    byte = 0x0A // broker is shutting down
+)
+
+// ErrorCodeToString renders a human-readable description of an error code.
 func ErrorCodeToString(code byte) string {
 	switch code {
 	case ErrCodeNone:
-		return "Success"
-	case ErrCodeUnknown:
-		return "Unknown error"
+		return "success"
 	case ErrCodeUnknownCommand:
-		return "Unknown command code"
-	case ErrCodeInvalidRequest:
-		return "Invalid request format"
-	case ErrCodePayloadTooShort:
-		return "Payload too short"
+		return "unknown command"
+	case ErrCodeMalformedRequest:
+		return "malformed request"
 	case ErrCodeMessageTooLarge:
-		return "Message too large"
-	case ErrCodeProduceTopicLen:
-		return "Produce Error: Invalid topic length in payload"
-	case ErrCodeProduceMissingData:
-		return "Produce Error: Missing message data in payload"
-	case ErrCodeProduceLogAccess:
-		return "Produce Error: Cannot access log"
-	case ErrCodeProduceAppendFailed:
-		return "Produce Error: Failed to append message"
-	case ErrCodeConsumeTopicLen:
-		return "Consume Error: Invalid topic length in payload"
-	case ErrCodeConsumeTopicNotFound:
-		return "Consume Error: Topic or partition not found"
-	case ErrCodeConsumeOffsetInvalid:
-		return "Consume Error: Offset out of range"
-	case ErrCodeConsumeReadFailed:
-		return "Consume Error: Failed to read message"
-
-	case ErrCodeOffsetGroupIDLen:
-		return "Offset Error: Invalid Group ID length/name in payload"
-	case ErrCodeOffsetTopicLen:
-		return "Offset Error: Invalid Topic length/name in payload"
-	case ErrCodeOffsetCommitFailed:
-		return "Offset Error: Failed to commit offset"
-	case ErrCodeOffsetFetchFailed:
-		return "Offset Error: Failed to fetch offset"
+		return "message too large"
+	case ErrCodeInvalidTopic:
+		return "invalid topic name"
+	case ErrCodeTopicNotFound:
+		return "topic or partition not found"
+	case ErrCodeOffsetOutOfRange:
+		return "offset out of range (data already deleted)"
+	case ErrCodeOffsetPastEnd:
+		return "offset past end (no new data)"
 	case ErrCodeOffsetNotFound:
-		return "Offset Info: No offset committed for group/topic/partition"
+		return "no committed offset for group/topic/partition"
+	case ErrCodeInternal:
+		return "internal broker error"
+	case ErrCodeUnavailable:
+		return "broker unavailable"
 	default:
-		return fmt.Sprintf("Unrecognized error code: 0x%X", code)
+		return "unrecognized error code"
 	}
 }

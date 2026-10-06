@@ -1,89 +1,75 @@
+// Command fluxgo-server runs the FluxGo broker.
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
-	broker "github.com/MX1MR41/fluxgo/internal/broker"
+	"github.com/MX1MR41/fluxgo/internal/broker"
 	cfg "github.com/MX1MR41/fluxgo/internal/config"
-	offset "github.com/MX1MR41/fluxgo/internal/offset"
-	store "github.com/MX1MR41/fluxgo/internal/store"
-)
-
-var (
-	configFile = flag.String("config", "configs/server.yaml", "Path to the server configuration file.")
+	"github.com/MX1MR41/fluxgo/internal/offset"
+	"github.com/MX1MR41/fluxgo/internal/store"
 )
 
 func main() {
+	configPath := flag.String("config", "configs/server.yaml", "path to the server configuration file")
+	verbose := flag.Bool("verbose", false, "enable debug logging")
 	flag.Parse()
 
-	config, err := cfg.LoadConfig(*configFile)
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
+
+	config, err := cfg.LoadConfig(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading configuration: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-
 	if err := config.EnsureDataDir(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error ensuring data directory: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	absDataDir, _ := filepath.Abs(config.Log.DataDir)
+	logger.Info("configuration loaded",
+		"listenAddress", config.Server.ListenAddress,
+		"dataDir", config.Log.DataDir,
+		"maxSegmentBytes", config.Log.MaxSegmentBytes,
+		"maxLogBytes", config.Log.MaxLogBytes,
+		"fileSync", config.Log.FileSync,
+	)
 
-	logStore, err := store.NewStore(absDataDir, config)
+	logStore, err := store.NewStore(config.Log.DataDir, config, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error initializing store in %s: %v\n", absDataDir, err)
+		logger.Error("failed to initialize store", "error", err)
 		os.Exit(1)
 	}
-
 	defer func() {
-		fmt.Println("Closing store...")
 		if err := logStore.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error closing store: %v\n", err)
+			logger.Error("failed to close store", "error", err)
 		}
 	}()
 
-	offsetManager, err := offset.NewManager(absDataDir)
+	offsetManager, err := offset.NewManager(config.Log.DataDir, logger)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error initializing offset manager in %s: %v\n", absDataDir, err)
+		logger.Error("failed to initialize offset manager", "error", err)
 		os.Exit(1)
 	}
 
-	srv, err := broker.NewServer(config, logStore, offsetManager)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating server: %v\n", err)
-		os.Exit(1)
-	}
+	srv := broker.NewServer(config, logStore, offsetManager, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	serverErr := make(chan error, 1)
-	go func() {
-		serverErr <- srv.Start(ctx)
-	}()
-
-	select {
-	case err := <-serverErr:
-		if err != nil && err != context.Canceled {
-			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
-
-		} else {
-			fmt.Println("Server stopped.")
-		}
-	case <-ctx.Done():
-		fmt.Println("Shutdown signal received, waiting for server to stop...")
-		err := <-serverErr
-		if err != nil && err != context.Canceled {
-			fmt.Fprintf(os.Stderr, "Server exited with error during shutdown: %v\n", err)
-		}
-		fmt.Println("Server shutdown complete.")
+	if err := srv.Start(ctx); err != nil {
+		logger.Error("server failed", "error", err)
+		os.Exit(1)
 	}
-
-	fmt.Println("FluxGo server exiting.")
-
+	logger.Info("shutdown complete")
 }

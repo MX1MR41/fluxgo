@@ -1,9 +1,19 @@
+// Package commitlog implements FluxGo's storage engine: a persistent,
+// append-only, segmented log for a single topic-partition.
+//
+// On-disk layout per segment (files named by zero-padded base offset):
+//
+//	00000000000000000000.log    [8B length][record][8B length][record]...
+//	00000000000000000000.index  [8B relative offset][8B log position]...
+//
+// The index holds one entry per record, so lookups are O(1) inside a segment
+// and O(log segments) across the log.
 package commitlog
 
 import (
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"os"
 	"sort"
 	"strconv"
@@ -12,151 +22,138 @@ import (
 )
 
 var (
-	ErrOffsetNotFound  = errors.New("offset not found")
-	ErrLogClosed       = errors.New("log is closed")
-	ErrSegmentNotFound = errors.New("segment for offset not found")
-	ErrIndexNotFound   = errors.New("index entry for offset not found")
-	ErrReadPastEnd     = errors.New("read past end of log")
-	ErrInvalidOffset   = errors.New("invalid offset requested")
+	// ErrOffsetNotFound is returned when the offset is not present in the log.
+	ErrOffsetNotFound = errors.New("commitlog: offset not found")
+	// ErrOffsetOutOfRange is returned when the offset is older than the
+	// earliest record still retained.
+	ErrOffsetOutOfRange = errors.New("commitlog: offset out of range")
+	// ErrReadPastEnd is returned when reading at or beyond the next offset
+	// to be assigned (i.e. there is no new data yet).
+	ErrReadPastEnd = errors.New("commitlog: read past end of log")
+	// ErrLogClosed is returned on operations on a closed log.
+	ErrLogClosed = errors.New("commitlog: log is closed")
+	// ErrIndexNotFound is returned when an index entry is missing.
+	ErrIndexNotFound = errors.New("commitlog: index entry not found")
+	// ErrCorruptSegment is returned when a record on disk is inconsistent.
+	ErrCorruptSegment = errors.New("commitlog: corrupt segment data")
 )
 
+// Record is a single message payload.
 type Record []byte
 
+// Config controls a single log's behavior.
 type Config struct {
-	Path            string
+	// MaxSegmentBytes triggers a rollover to a new segment when the active
+	// segment reaches this size. A single record may exceed it.
 	MaxSegmentBytes int64
-	MaxLogBytes     int64
-	FileSync        bool
+	// MaxLogBytes bounds the total size of the log; oldest segments are
+	// deleted after appends while the total exceeds it. 0 disables.
+	MaxLogBytes int64
+	// FileSync fsyncs after every append when true (durable, slower).
+	FileSync bool
 }
 
+// DefaultConfig returns sane defaults for a small broker.
 func DefaultConfig() Config {
 	return Config{
-		Path:            "./fluxgo-data/",
-		MaxSegmentBytes: 1024 * 1024 * 16,
+		MaxSegmentBytes: 16 * 1024 * 1024,
 		MaxLogBytes:     1024 * 1024 * 1024,
 		FileSync:        true,
 	}
 }
 
-type Log interface {
-	Append(record Record) (offset uint64, err error)
-	Read(offset uint64) (Record, error)
-	Close() error
-	Name() string
-	Dir() string
-	HighestOffset() uint64
-	LowestOffset() uint64
+// Log is the commit log for one topic-partition. It is safe for concurrent
+// use: reads proceed in parallel while appends are serialized.
+type Log struct {
+	mu     sync.RWMutex
+	dir    string
+	name   string
+	config Config
+	logger *slog.Logger
 
-	io.Closer
-}
-
-type commitLog struct {
-	mu       sync.RWMutex
-	dir      string
-	name     string
-	config   Config
-	segments []*Segment
-
+	segments      []*Segment // sorted by base offset
 	activeSegment *Segment
 	totalSize     int64
 
 	closed bool
 }
 
-func NewLog(dir string, name string, config Config) (Log, error) {
-
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create log directory %s: %w", dir, err)
+// Open loads the log stored in dir (creating it if necessary) and returns it
+// ready for appends and reads. Crash recovery runs on every segment found.
+func Open(dir, name string, config Config, logger *slog.Logger) (*Log, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("commitlog: failed to create log directory %s: %w", dir, err)
 	}
 
-	l := &commitLog{
-		dir:    dir,
-		name:   name,
-		config: config,
-	}
+	l := &Log{dir: dir, name: name, config: config, logger: logger}
 
 	if err := l.loadSegments(); err != nil {
-		return nil, fmt.Errorf("failed to load segments for log %s: %w", name, err)
+		return nil, fmt.Errorf("commitlog: failed to load segments for %s: %w", name, err)
 	}
 
 	if len(l.segments) == 0 {
-		initialSegment, err := newSegment(l.dir, 0, l.config)
+		seg, err := openSegment(l.dir, 0, l.config, true, l.logger)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create initial segment for log %s: %w", name, err)
+			return nil, fmt.Errorf("commitlog: failed to create initial segment for %s: %w", name, err)
 		}
-		l.segments = append(l.segments, initialSegment)
-		l.activeSegment = initialSegment
-		l.totalSize = initialSegment.storeSize
-	} else {
-
-		l.activeSegment = l.segments[len(l.segments)-1]
-
-		for _, s := range l.segments {
-			l.totalSize += s.storeSize
-		}
+		l.segments = []*Segment{seg}
 	}
-
+	l.activeSegment = l.segments[len(l.segments)-1]
+	for _, s := range l.segments {
+		l.totalSize += s.Size()
+	}
 	return l, nil
 }
 
-func (l *commitLog) loadSegments() error {
+// loadSegments discovers segment files in the log directory. Pairing is
+// driven by .log files; an orphan .index is ignored (the segment's recovery
+// rebuilds it), and stray files are skipped with a warning.
+func (l *Log) loadSegments() error {
 	files, err := os.ReadDir(l.dir)
 	if err != nil {
-		return fmt.Errorf("failed to read log directory %s: %w", l.dir, err)
+		return fmt.Errorf("commitlog: failed to read log directory %s: %w", l.dir, err)
 	}
 
 	var baseOffsets []uint64
-	segmentFiles := make(map[uint64]bool)
-
 	for _, file := range files {
-		if file.IsDir() {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), logSuffix) {
 			continue
 		}
-		fileName := file.Name()
-		if strings.HasSuffix(fileName, logSuffix) || strings.HasSuffix(fileName, indexSuffix) {
-			baseOffsetStr := strings.TrimSuffix(strings.TrimSuffix(fileName, logSuffix), indexSuffix)
-			baseOffset, err := strconv.ParseUint(baseOffsetStr, 10, 64)
-			if err != nil {
-
-				fmt.Fprintf(os.Stderr, "Warning: Ignoring file with invalid name format in %s: %s\n", l.dir, fileName)
-				continue
-			}
-			if _, found := segmentFiles[baseOffset]; !found {
-				segmentFiles[baseOffset] = true
-				baseOffsets = append(baseOffsets, baseOffset)
-			}
+		base, err := strconv.ParseUint(strings.TrimSuffix(file.Name(), logSuffix), 10, 64)
+		if err != nil {
+			l.logger.Warn("commitlog: ignoring file with invalid name",
+				"dir", l.dir, "file", file.Name())
+			continue
 		}
+		baseOffsets = append(baseOffsets, base)
 	}
-
-	sort.Slice(baseOffsets, func(i, j int) bool {
-		return baseOffsets[i] < baseOffsets[j]
-	})
+	sort.Slice(baseOffsets, func(i, j int) bool { return baseOffsets[i] < baseOffsets[j] })
 
 	l.segments = make([]*Segment, 0, len(baseOffsets))
-
-	for _, baseOffset := range baseOffsets {
-
-		segment, err := newSegment(l.dir, baseOffset, l.config)
+	for i, base := range baseOffsets {
+		// A crash can only tear the segment that was active at the time, i.e.
+		// the last one on disk; with file_sync disabled a torn tail can also
+		// survive in sealed segments, so those are reconciled too.
+		reconcile := !l.config.FileSync || i == len(baseOffsets)-1
+		seg, err := openSegment(l.dir, base, l.config, reconcile, l.logger)
 		if err != nil {
-
-			l.cleanupSegments()
-			return fmt.Errorf("failed to load segment with base offset %d: %w", baseOffset, err)
+			for _, s := range l.segments {
+				s.Close()
+			}
+			l.segments = nil
+			return fmt.Errorf("commitlog: failed to open segment %d: %w", base, err)
 		}
-
-		l.segments = append(l.segments, segment)
+		l.segments = append(l.segments, seg)
 	}
-
 	return nil
 }
 
-func (l *commitLog) cleanupSegments() {
-	for _, s := range l.segments {
-		s.Close()
-	}
-	l.segments = nil
-}
-
-func (l *commitLog) Append(record Record) (offset uint64, err error) {
+// Append adds the record to the log and returns its absolute offset. Size
+// based retention runs after a successful append.
+func (l *Log) Append(record Record) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -165,200 +162,240 @@ func (l *commitLog) Append(record Record) (offset uint64, err error) {
 	}
 
 	if l.activeSegment.IsFull() {
-		if err := l.rollSegment(); err != nil {
-			return 0, fmt.Errorf("failed to roll segment for log %s: %w", l.name, err)
+		if err := l.rollSegmentLocked(); err != nil {
+			return 0, fmt.Errorf("commitlog: failed to roll segment for %s: %w", l.name, err)
 		}
 	}
 
-	offset, err = l.activeSegment.Append(record)
+	offset, err := l.activeSegment.Append(record)
 	if err != nil {
 		return 0, err
 	}
+	l.totalSize += int64(len(record)) + recordLengthWidth
 
-	l.totalSize += int64(len(record) + recordLengthWidth)
-
+	if err := l.applyRetentionLocked(); err != nil {
+		// Retention failures are non-fatal for the append itself; the record
+		// is durably stored. Log loudly and keep going.
+		l.logger.Error("commitlog: retention failed", "log", l.name, "error", err)
+	}
 	return offset, nil
 }
 
-func (l *commitLog) rollSegment() error {
-
+// rollSegmentLocked seals the active segment and starts a new one. Caller
+// must hold the write lock.
+func (l *Log) rollSegmentLocked() error {
+	// Make sure the sealed segment is durable before moving on.
 	if err := l.activeSegment.index.Sync(); err != nil {
-
-		fmt.Fprintf(os.Stderr, "Warning: failed to sync index %s before rolling: %v\n", l.activeSegment.index.Name(), err)
+		l.logger.Warn("commitlog: failed to sync index before rolling",
+			"log", l.name, "error", err)
 	}
 	if err := l.activeSegment.store.Sync(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to sync store %s before rolling: %v\n", l.activeSegment.store.Name(), err)
+		l.logger.Warn("commitlog: failed to sync log before rolling",
+			"log", l.name, "error", err)
 	}
 
-	nextBaseOffset := l.activeSegment.NextOffset()
-	newSegment, err := newSegment(l.dir, nextBaseOffset, l.config)
+	nextBase := l.activeSegment.NextOffset()
+	seg, err := openSegment(l.dir, nextBase, l.config, true, l.logger)
 	if err != nil {
-		return fmt.Errorf("failed to create new segment with base offset %d: %w", nextBaseOffset, err)
+		return err
 	}
-
-	l.segments = append(l.segments, newSegment)
-	l.activeSegment = newSegment
-
-	l.totalSize += newSegment.storeSize
-
+	l.segments = append(l.segments, seg)
+	l.activeSegment = seg
 	return nil
 }
 
-func (l *commitLog) Read(offset uint64) (Record, error) {
+// Read returns the record at the given absolute offset.
+func (l *Log) Read(offset uint64) (Record, error) {
+	records, err := l.ReadBatch(offset, 1, 0)
+	if err != nil {
+		return nil, err
+	}
+	return records[0], nil
+}
+
+// ReadBatch returns up to maxRecords consecutive records starting at offset,
+// crossing segment boundaries as needed. maxBytes bounds the total payload
+// size returned (0 means no limit); a single record larger than maxBytes is
+// still returned so consumers always make progress.
+//
+// Possible errors: ErrOffsetOutOfRange (offset is older than the retained
+// data), ErrReadPastEnd (no new data at offset yet).
+func (l *Log) ReadBatch(offset uint64, maxRecords int, maxBytes int) ([]Record, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
 	if l.closed {
 		return nil, ErrLogClosed
 	}
-
-	segment := l.findSegment(offset)
-	if segment == nil {
-
-		highest := l.HighestOffset()
-		if offset >= highest {
-			return nil, ErrReadPastEnd
-		}
-
-		return nil, ErrOffsetNotFound
+	if maxRecords < 1 {
+		maxRecords = 1
 	}
 
-	return segment.Read(offset)
+	// Read watermarks directly instead of via the locking accessors: holding
+	// RLock here and acquiring it again inside LowestOffset/HighestOffset
+	// would risk deadlock once a writer is queued (sync.RWMutex read locks
+	// are not re-entrant).
+	low := l.segments[0].BaseOffset()
+	high := l.activeSegment.NextOffset()
+
+	switch {
+	case offset < low:
+		return nil, ErrOffsetOutOfRange
+	case offset >= high:
+		return nil, ErrReadPastEnd
+	}
+
+	start := l.findSegmentIndexLocked(offset)
+	records := make([]Record, 0, min(maxRecords, 64))
+	total := 0
+
+	for i := start; i < len(l.segments) && len(records) < maxRecords; i++ {
+		seg := l.segments[i]
+		segOffset := offset
+		if i > start {
+			segOffset = seg.BaseOffset()
+		}
+		remaining := 0
+		if maxBytes > 0 {
+			remaining = maxBytes - total
+			if remaining <= 0 {
+				break
+			}
+		}
+		// The first record overall may exceed maxBytes (so consumers can
+		// always make progress); once anything has been collected the limit
+		// becomes strict, otherwise per-segment exceptions would compound.
+		atLeastOne := len(records) == 0
+		batch, err := seg.readBatch(segOffset, maxRecords-len(records), remaining, atLeastOne)
+		if err != nil {
+			// The first segment is guaranteed to contain offset; later
+			// segments report ErrOffsetNotFound only when empty.
+			if errors.Is(err, ErrOffsetNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		for _, rec := range batch {
+			records = append(records, rec)
+			total += len(rec) + recordLengthWidth
+		}
+	}
+
+	if len(records) == 0 {
+		return nil, ErrReadPastEnd
+	}
+	return records, nil
 }
 
-func (l *commitLog) findSegment(offset uint64) *Segment {
-
-	idx := sort.Search(len(l.segments), func(i int) bool {
-
+// findSegmentIndexLocked returns the index of the segment that contains (or
+// should contain) offset. Caller must hold a lock.
+func (l *Log) findSegmentIndexLocked(offset uint64) int {
+	i := sort.Search(len(l.segments), func(i int) bool {
 		return l.segments[i].BaseOffset() > offset
 	})
-
-	if idx == 0 {
-		return nil
+	if i == 0 {
+		return 0
 	}
-	targetSegment := l.segments[idx-1]
-
-	if offset < targetSegment.NextOffset() {
-		return targetSegment
-	}
-
-	return nil
+	return i - 1
 }
 
-func (l *commitLog) Close() error {
+// applyRetentionLocked deletes the oldest whole segments while the total log
+// size exceeds MaxLogBytes. The active segment is never removed. Caller must
+// hold the write lock.
+func (l *Log) applyRetentionLocked() error {
+	if l.config.MaxLogBytes <= 0 || l.totalSize <= l.config.MaxLogBytes || len(l.segments) <= 1 {
+		return nil
+	}
+
+	var remove []*Segment
+	var freed int64
+	for _, seg := range l.segments[:len(l.segments)-1] {
+		if l.totalSize-freed <= l.config.MaxLogBytes {
+			break
+		}
+		remove = append(remove, seg)
+		freed += seg.Size()
+	}
+	if len(remove) == 0 {
+		return nil
+	}
+
+	l.segments = l.segments[len(remove):]
+	l.totalSize -= freed
+	l.logger.Info("commitlog: applying retention",
+		"log", l.name, "segmentsRemoved", len(remove), "bytesFreed", freed)
+
+	var errs []error
+	for _, seg := range remove {
+		if err := seg.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		if err := seg.Remove(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Close seals the log and all of its segments.
+func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if l.closed {
 		return nil
 	}
-
 	l.closed = true
 
-	var closeErrors []error
-	for _, segment := range l.segments {
-		if err := segment.Close(); err != nil {
-			closeErrors = append(closeErrors, fmt.Errorf("failed to close segment %d: %w", segment.BaseOffset(), err))
+	var errs []error
+	for _, seg := range l.segments {
+		if err := seg.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("segment %d: %w", seg.BaseOffset(), err))
 		}
 	}
-
 	l.segments = nil
 	l.activeSegment = nil
 	l.totalSize = 0
-
-	if len(closeErrors) > 0 {
-
-		errorMessages := make([]string, len(closeErrors))
-		for i, err := range closeErrors {
-			errorMessages[i] = err.Error()
-		}
-		return errors.New(strings.Join(errorMessages, "; "))
-	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
-func (l *commitLog) Name() string {
+// Name returns the log's name ("topic_partition").
+func (l *Log) Name() string { return l.name }
 
-	return l.name
-}
+// Dir returns the log's data directory.
+func (l *Log) Dir() string { return l.dir }
 
-func (l *commitLog) Dir() string {
-	return l.dir
-}
-
-func (l *commitLog) HighestOffset() uint64 {
+// HighestOffset returns the offset that will be assigned to the next append
+// (i.e. one past the last stored record; 0 for an empty log).
+func (l *Log) HighestOffset() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-
 	if l.activeSegment == nil {
 		return 0
 	}
 	return l.activeSegment.NextOffset()
 }
 
-func (l *commitLog) LowestOffset() uint64 {
+// LowestOffset returns the oldest offset still retained.
+func (l *Log) LowestOffset() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-
 	if len(l.segments) == 0 {
 		return 0
 	}
-
 	return l.segments[0].BaseOffset()
 }
 
-func (l *commitLog) applyRetention() error {
+// Size returns the total size of the log's data files in bytes.
+func (l *Log) Size() int64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.totalSize
+}
 
-	if l.config.MaxLogBytes <= 0 || l.totalSize <= l.config.MaxLogBytes || len(l.segments) <= 1 {
-		return nil
-	}
-
-	fmt.Printf("Log %s: Applying retention. Current size: %d, Max size: %d\n", l.name, l.totalSize, l.config.MaxLogBytes)
-
-	segmentsToRemove := make([]*Segment, 0)
-	var sizeReduced int64
-
-	for i := 0; i < len(l.segments)-1; i++ {
-		segment := l.segments[i]
-		if l.totalSize-sizeReduced <= l.config.MaxLogBytes {
-			break
-		}
-		fmt.Printf("Log %s: Marking segment %d for removal (size %d)\n", l.name, segment.BaseOffset(), segment.storeSize)
-		segmentsToRemove = append(segmentsToRemove, segment)
-		sizeReduced += segment.storeSize
-	}
-
-	if len(segmentsToRemove) == 0 {
-		return nil
-	}
-
-	l.segments = l.segments[len(segmentsToRemove):]
-	l.totalSize -= sizeReduced
-
-	var removalErrors []error
-	for _, segment := range segmentsToRemove {
-		fmt.Printf("Log %s: Closing and removing segment %d\n", l.name, segment.BaseOffset())
-
-		if err := segment.Close(); err != nil {
-			removalErrors = append(removalErrors, fmt.Errorf("failed to close segment %d for removal: %w", segment.BaseOffset(), err))
-
-		}
-
-		if err := segment.Remove(); err != nil {
-			removalErrors = append(removalErrors, fmt.Errorf("failed to remove files for segment %d: %w", segment.BaseOffset(), err))
-		}
-	}
-
-	if len(removalErrors) > 0 {
-		errorMessages := make([]string, len(removalErrors))
-		for i, err := range removalErrors {
-			errorMessages[i] = err.Error()
-		}
-
-		return fmt.Errorf("errors occurred during log retention cleanup: %s", strings.Join(errorMessages, "; "))
-	}
-
-	fmt.Printf("Log %s: Retention applied. New size: %d, Segments left: %d\n", l.name, l.totalSize, len(l.segments))
-	return nil
+// SegmentCount returns the number of segments on disk.
+func (l *Log) SegmentCount() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return len(l.segments)
 }
